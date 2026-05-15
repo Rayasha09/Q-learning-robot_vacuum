@@ -1,10 +1,5 @@
-pandas
 numpy
-scikit-learn
-joblib
+pygame
 matplotlib
-seaborn
+imageio
 streamlit
-altair
-plotly
-

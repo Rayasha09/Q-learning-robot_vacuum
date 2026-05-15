@@ -1,172 +1,224 @@
-from __future__ import annotations
-
-import json
+import random
 from pathlib import Path
 
-import joblib
-import matplotlib
+import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import silhouette_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-matplotlib.use("Agg")
-sns.set_theme(style="whitegrid")
-
-BASE_DIR = Path(__file__).resolve().parent
-CC_INFO_PATH = BASE_DIR / "cc_info.csv"
-TRANSACTIONS_PATH = BASE_DIR / "transactions.csv"
-MODEL_PATH = BASE_DIR / "model.joblib"
-CLUSTERED_DATA_PATH = BASE_DIR / "clustered_cards.csv"
-METRICS_PATH = BASE_DIR / "metrics.json"
-FIGURE_PATH = BASE_DIR / "cluster_scatter.png"
-
-FEATURE_COLUMNS = [
-    "credit_card_limit",
-    "total_transactions",
-    "total_amount",
-    "avg_amount",
-    "std_amount",
-    "max_amount",
-    "active_days",
-    "avg_daily_transactions",
-    "weekend_ratio",
-    "mean_hour",
-    "mean_long",
-    "mean_lat",
-]
+import numpy as np
+import pygame
 
 
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    cc_info = pd.read_csv(CC_INFO_PATH)
-    transactions = pd.read_csv(TRANSACTIONS_PATH, parse_dates=["date"])
-    return cc_info, transactions
+GRID_SIZE = 6
+CELL = 95
+PANEL = 320
+WIDTH = GRID_SIZE * CELL + PANEL
+HEIGHT = GRID_SIZE * CELL
+
+EPISODES = 1000
+MAX_STEPS = 80
+ALPHA = 0.1
+GAMMA = 0.9
+EPSILON = 1.0
+EPSILON_MIN = 0.01
+EPSILON_DECAY = 0.992
+
+TRAIN_SPEED = 8
+DEMO_SPEED = 2
+
+LEVEL = "easy"
+Q_TABLE_FILE = Path("q_table.npy")
+LEVELS = {
+    "easy": {
+        "obstacles": {(2, 2), (4, 1)},
+        "dirt_spots": [(0, 5), (2, 0), (5, 1), (5, 5)],
+        "start": (0, 0),
+        "rewards": {"wall": -15, "obstacle": -20, "step": -1, "clean": 35, "finish": 140},
+    },
+    "medium": {
+        "obstacles": {(1, 2), (3, 3), (4, 1)},
+        "dirt_spots": [(0, 5), (2, 0), (2, 4), (5, 1), (5, 5)],
+        "start": (0, 0),
+        "rewards": {"wall": -30, "obstacle": -40, "step": -1, "clean": 35, "finish": 150},
+    },
+    "hard": {
+        "obstacles": {(1, 1), (1, 4), (2, 2), (3, 3), (4, 1), (4, 4)},
+        "dirt_spots": [(0, 5), (1, 3), (2, 0), (3, 5), (5, 1), (5, 5)],
+        "start": (0, 0),
+        "rewards": {"wall": -35, "obstacle": -45, "step": -2, "clean": 30, "finish": 160},
+    },
+}
+
+CFG = LEVELS[LEVEL]
+OBSTACLES = CFG["obstacles"]
+DIRT_SPOTS = CFG["dirt_spots"]
+START = CFG["start"]
+REWARDS = CFG["rewards"]
+
+q_table = np.zeros((GRID_SIZE * GRID_SIZE * (2 ** len(DIRT_SPOTS)), 4))
+MOVES = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+BG = (242, 245, 247)
+GRID = (190, 198, 205)
+WALL = (180, 65, 65)
+TEXT = (35, 40, 45)
+ROBOT = (55, 125, 255)
+DIRTY = (234, 201, 112)
+CLEAN = (204, 237, 210)
+SIDE = (226, 232, 236)
+DARK = (75, 80, 85)
+GREEN = (55, 150, 90)
 
 
-def build_card_level_dataset() -> pd.DataFrame:
-    cc_info, transactions = load_data()
-    tx = transactions.copy()
-    tx["tx_date"] = tx["date"].dt.date
-    tx["is_weekend"] = tx["date"].dt.dayofweek >= 5
-    tx["hour"] = tx["date"].dt.hour
-
-    aggregated = tx.groupby("credit_card").agg(
-        total_transactions=("transaction_dollar_amount", "size"),
-        total_amount=("transaction_dollar_amount", "sum"),
-        avg_amount=("transaction_dollar_amount", "mean"),
-        std_amount=("transaction_dollar_amount", "std"),
-        max_amount=("transaction_dollar_amount", "max"),
-        active_days=("tx_date", "nunique"),
-        weekend_ratio=("is_weekend", "mean"),
-        mean_hour=("hour", "mean"),
-        mean_long=("Long", "mean"),
-        mean_lat=("Lat", "mean"),
-    )
-    aggregated["avg_daily_transactions"] = (
-        aggregated["total_transactions"] / aggregated["active_days"].clip(lower=1)
-    )
-    aggregated["std_amount"] = aggregated["std_amount"].fillna(0.0)
-
-    return cc_info.merge(aggregated.reset_index(), on="credit_card", how="inner")
+def state_id(pos, mask):
+    return (pos[0] * GRID_SIZE + pos[1]) * (2 ** len(DIRT_SPOTS)) + mask
 
 
-def build_preprocessor() -> Pipeline:
-    return Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
+def update_mask(pos, mask):
+    for i, dirt in enumerate(DIRT_SPOTS):
+        if pos == dirt:
+            mask |= 1 << i
+    return mask
 
 
-def choose_best_k(features: pd.DataFrame) -> tuple[int, float, list[dict[str, float]]]:
-    preprocessor = build_preprocessor()
-    transformed = preprocessor.fit_transform(features)
+def step(pos, mask, action):
+    dr, dc = MOVES[action]
+    nr, nc = pos[0] + dr, pos[1] + dc
+    if nr < 0 or nr >= GRID_SIZE or nc < 0 or nc >= GRID_SIZE:
+        return pos, mask, REWARDS["wall"], False, "wall"
+    nxt = (nr, nc)
+    if nxt in OBSTACLES:
+        return pos, mask, REWARDS["obstacle"], False, "obstacle"
+    reward = REWARDS["step"]
+    new_mask = mask
+    if nxt in DIRT_SPOTS:
+        old = new_mask
+        new_mask = update_mask(nxt, new_mask)
+        if new_mask != old:
+            reward = REWARDS["clean"]
+    done = new_mask == (2 ** len(DIRT_SPOTS)) - 1
+    if done:
+        reward = REWARDS["finish"]
+    return nxt, new_mask, reward, done, None
 
-    best_k = 2
-    best_score = -1.0
-    all_scores: list[dict[str, float]] = []
 
-    for k in range(2, 9):
-        model = KMeans(n_clusters=k, random_state=42, n_init=20)
-        labels = model.fit_predict(transformed)
-        score = silhouette_score(transformed, labels)
-        all_scores.append({"k": int(k), "silhouette_score": float(score)})
-        if score > best_score:
-            best_k = k
-            best_score = score
+def draw(screen, font, big_font, pos, mask, ep, total, eps, mode, hit=None):
+    screen.fill(BG)
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            rect = pygame.Rect(c * CELL, r * CELL, CELL, CELL)
+            color = (250, 250, 250)
+            if (r, c) in OBSTACLES:
+                color = WALL
+            elif (r, c) in DIRT_SPOTS:
+                i = DIRT_SPOTS.index((r, c))
+                color = CLEAN if mask & (1 << i) else DIRTY
+            pygame.draw.rect(screen, color, rect)
+            pygame.draw.rect(screen, GRID, rect, 1)
+            if (r, c) in DIRT_SPOTS and not mask & (1 << DIRT_SPOTS.index((r, c))):
+                pygame.draw.circle(screen, DARK, (c * CELL + CELL // 2, r * CELL + CELL // 2), 10)
 
-    return best_k, best_score, all_scores
+    x, y = pos[1] * CELL + CELL // 2, pos[0] * CELL + CELL // 2
+    pygame.draw.circle(screen, ROBOT, (x, y), CELL // 3)
+    pygame.draw.circle(screen, DARK, (x, y), CELL // 3, 4)
+    pygame.draw.circle(screen, DARK, (x - 12, y - 8), 4)
+    pygame.draw.circle(screen, DARK, (x + 12, y - 8), 4)
+    pygame.draw.arc(screen, DARK, pygame.Rect(x - 16, y - 2, 32, 18), 0.2, 3.0, 3)
+
+    pygame.draw.rect(screen, SIDE, (GRID_SIZE * CELL, 0, PANEL, HEIGHT))
+    tx = GRID_SIZE * CELL + 20
+    screen.blit(big_font.render("Robot Vacuum", True, TEXT), (tx, 25))
+    screen.blit(font.render(mode, True, GREEN), (tx, 80))
+    screen.blit(font.render(f"Level: {LEVEL}", True, TEXT), (tx, 140))
+    screen.blit(font.render(f"Episode: {ep}", True, TEXT), (tx, 185))
+    screen.blit(font.render(f"Reward: {total}", True, TEXT), (tx, 230))
+    screen.blit(font.render(f"Epsilon: {eps:.3f}", True, TEXT), (tx, 275))
+    screen.blit(font.render(f"Cleaned: {bin(mask).count('1')}/{len(DIRT_SPOTS)}", True, TEXT), (tx, 320))
+    if hit == "wall":
+        screen.blit(font.render("Penalty: wall", True, WALL), (tx, 380))
+    if hit == "obstacle":
+        screen.blit(font.render("Penalty: obstacle", True, WALL), (tx, 380))
+    pygame.display.flip()
 
 
-def save_figure(dataset: pd.DataFrame) -> None:
-    plt.figure(figsize=(10, 6))
-    sns.scatterplot(
-        data=dataset,
-        x="pca_1",
-        y="pca_2",
-        hue="cluster",
-        palette="tab10",
-        s=80,
-    )
-    plt.title("KMeans Clusters in PCA Space")
+def frame(screen):
+    return np.transpose(pygame.surfarray.array3d(screen), (1, 0, 2))
+
+
+def run_demo(screen, clock, font, big_font):
+    gif_frames = []
+    pos, mask, total = START, update_mask(START, 0), 0
+    for _ in range(MAX_STEPS):
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit()
+                return
+        s = state_id(pos, mask)
+        action = int(np.argmax(q_table[s]))
+        pos, mask, reward, done, hit = step(pos, mask, action)
+        total += reward
+        draw(screen, font, big_font, pos, mask, EPISODES, total, 0.0, "Demo", hit)
+        gif_frames.append(frame(screen))
+        clock.tick(DEMO_SPEED)
+        if done:
+            for _ in range(8):
+                gif_frames.append(frame(screen))
+            break
+
+    imageio.mimsave("robot_vacuum.gif", gif_frames, duration=0.3)
+
+
+def train():
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("arial", 26)
+    big_font = pygame.font.SysFont("arial", 34, bold=True)
+
+    if Q_TABLE_FILE.exists():
+        global q_table
+        q_table = np.load(Q_TABLE_FILE)
+        run_demo(screen, clock, font, big_font)
+        pygame.quit()
+        return
+
+    epsilon = EPSILON
+    rewards = []
+    for ep in range(1, EPISODES + 1):
+        pos, mask, total = START, update_mask(START, 0), 0
+        for _ in range(MAX_STEPS):
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    return
+            s = state_id(pos, mask)
+            action = random.randint(0, 3) if random.random() < epsilon else int(np.argmax(q_table[s]))
+            nxt, nxt_mask, reward, done, hit = step(pos, mask, action)
+            ns = state_id(nxt, nxt_mask)
+            q_table[s, action] += ALPHA * (reward + GAMMA * np.max(q_table[ns]) - q_table[s, action])
+            pos, mask, total = nxt, nxt_mask, total + reward
+            if ep <= 15 or ep % 40 == 0 or ep > EPISODES - 80:
+                draw(screen, font, big_font, pos, mask, ep, total, epsilon, "Training", hit)
+                clock.tick(TRAIN_SPEED)
+            if done:
+                break
+        rewards.append(total)
+        epsilon = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
+
+    np.save (Q_TABLE_FILE, q_table)
+    run_demo(screen, clock, font, big_font)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards, color="steelblue", label="Reward")
+    smooth = [np.mean(rewards[max(0, i - 29):i + 1]) for i in range(len(rewards))]
+    plt.plot(smooth, color="darkgreen", linewidth=2.5, label="Moving average")
+    plt.title("Learning Curve")
+    plt.xlabel("es")
+    plt.ylabel("Total Reward")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(FIGURE_PATH, dpi=200)
-    plt.close()
-
-
-def train() -> None:
-    dataset = build_card_level_dataset()
-    features = dataset[FEATURE_COLUMNS].copy()
-
-    best_k, best_score, all_scores = choose_best_k(features)
-
-    preprocessor = build_preprocessor()
-    transformed = preprocessor.fit_transform(features)
-
-    model = KMeans(n_clusters=best_k, random_state=42, n_init=20)
-    dataset["cluster"] = model.fit_predict(transformed)
-
-    pca = PCA(n_components=2, random_state=42)
-    components = pca.fit_transform(transformed)
-    dataset["pca_1"] = components[:, 0]
-    dataset["pca_2"] = components[:, 1]
-
-    model_bundle = {
-        "model": model,
-        "preprocessor": preprocessor,
-        "pca": pca,
-        "feature_columns": FEATURE_COLUMNS,
-        "best_k": best_k,
-        "silhouette_score": best_score,
-    }
-
-    joblib.dump(model_bundle, MODEL_PATH)
-    dataset.to_csv(CLUSTERED_DATA_PATH, index=False)
-    METRICS_PATH.write_text(
-        json.dumps(
-            {
-                "dataset_name": "Credit Card Transactions Synthetic Data Generation",
-                "best_k": best_k,
-                "silhouette_score": best_score,
-                "scores": all_scores,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    save_figure(dataset)
-
-    print(f"Dataset: Credit Card Transactions Synthetic Data Generation")
-    print(f"Model saved to: {MODEL_PATH.name}")
-    print(f"Clustered dataset saved to: {CLUSTERED_DATA_PATH.name}")
-    print(f"Best number of clusters: {best_k}")
-    print(f"Silhouette score: {best_score:.4f}")
+    plt.savefig("learning_curve.png")
+    plt.show()
+    pygame.quit()
 
 
 if __name__ == "__main__":
